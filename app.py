@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from datetime import datetime
+import plotly.graph_objects as go # 세밀한 차트 제어를 위해 변경
+import requests
+from bs4 import BeautifulSoup
 
 # -----------------------------------------------------------------------------
-# 1. 페이지 설정 (반드시 맨 윗줄에 있어야 함)
+# 1. 페이지 설정
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="KB 부동산 인사이트 Pro",
@@ -13,200 +14,245 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# -----------------------------------------------------------------------------
-# 2. 스타일 및 헤더 (앱 느낌 나게 꾸미기)
-# -----------------------------------------------------------------------------
+# 스타일 적용 (깔끔한 카드 디자인)
 st.markdown("""
 <style>
-    .main-header {font-size: 2.5rem; font-weight: 700; color: #1E3A8A;}
-    .sub-header {font-size: 1.2rem; color: #64748B;}
-    .metric-card {background-color: #F8FAFC; padding: 20px; border-radius: 10px; border: 1px solid #E2E8F0;}
+    .news-card {
+        background-color: #f9f9f9;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        border-left: 5px solid #03C75A;
+    }
+    .news-title {
+        font-weight: bold;
+        font-size: 1.1em;
+        text-decoration: none;
+        color: #333;
+    }
+    .news-title:hover {
+        color: #03C75A;
+        text-decoration: underline;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-header">🏢 KB 부동산 인사이트 Pro</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">빅데이터 기반 주간/월간 시세 흐름 분석 대시보드</div>', unsafe_allow_html=True)
-st.markdown("---")
+st.title("🏢 KB 부동산 인사이트 Pro")
+st.markdown("매매와 전세 흐름을 한눈에 비교하고, 해당 지역의 최신 뉴스까지 확인하세요.")
 
 # -----------------------------------------------------------------------------
-# 3. 사이드바: 데이터 업로드 및 설정
+# 2. 함수 정의 (뉴스 크롤링 & 데이터 로드)
+# -----------------------------------------------------------------------------
+
+# (1) 네이버 뉴스 제목 가져오기 (캐싱 적용으로 속도 향상)
+@st.cache_data(ttl=600) # 10분마다 갱신
+def get_real_news(keyword):
+    try:
+        url = f"https://search.naver.com/search.naver?where=news&query={keyword}&sm=tab_opt&sort=1&photo=0&field=0&pd=0&ds=&de=&docid=&related=0&mynews=0&office_type=0&office_section_code=0&news_office_checked=&nso=so%3Add%2Cp%3Aall&is_sug_officeid=0"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        req = requests.get(url, headers=headers)
+        soup = BeautifulSoup(req.text, 'html.parser')
+        
+        news_list = []
+        # 네이버 뉴스 구조에 따른 클래스명 (변경될 수 있음)
+        items = soup.select('div.news_wrap.api_ani_send')
+        
+        for item in items[:5]: # 상위 5개만
+            title = item.select_one('a.news_tit').get_text()
+            link = item.select_one('a.news_tit')['href']
+            desc = item.select_one('div.news_dsc').get_text()
+            news_list.append({'title': title, 'link': link, 'desc': desc})
+            
+        return news_list
+    except Exception:
+        return []
+
+# (2) 데이터 전처리 함수 (매매/전세 공통)
+def load_and_clean_data(file, sheet_keyword):
+    xls = pd.ExcelFile(file)
+    target_sheet = None
+    for name in xls.sheet_names:
+        if sheet_keyword in name and "종합" in name:
+            target_sheet = name
+            break
+    
+    if not target_sheet:
+        return None
+    
+    # 데이터 읽기
+    df = pd.read_excel(file, sheet_name=target_sheet, header=10)
+    
+    # 컬럼명 문자열 변환 및 이상한 컬럼 제거
+    df.columns = df.columns.astype(str)
+    
+    # "50.83..." 같은 숫자형 컬럼 이름 제거 로직
+    # 보통 지역명은 한글이므로, 한글이 포함되지 않고 숫자만 있는 컬럼을 날림
+    clean_cols = []
+    for c in df.columns:
+        # 날짜 컬럼은 살림
+        if c == df.columns[0]: 
+            clean_cols.append(c)
+            continue
+            
+        # 컬럼 이름이 실수(float)처럼 보이면 스킵
+        try:
+            float(c)
+            continue # 숫자면 추가 안 함
+        except:
+            clean_cols.append(c) # 문자면 추가
+            
+    df = df[clean_cols]
+
+    # 날짜 정리
+    df.rename(columns={df.columns[0]: '날짜'}, inplace=True)
+    df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
+    df = df.dropna(subset=['날짜'])
+    
+    return df
+
+# -----------------------------------------------------------------------------
+# 3. 메인 로직
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.header("📂 데이터 센터")
-    uploaded_file = st.file_uploader("KB 시계열 엑셀(.xlsx) 업로드", type=['xlsx', 'xls'])
+    st.header("📂 설정")
+    uploaded_file = st.file_uploader("KB 엑셀 파일 업로드", type=['xlsx', 'xls'])
     
-    st.info("""
-    **💡 사용 가이드**
-    1. KB부동산(kbland.kr)에서 '주간 아파트 시세' 다운로드
-    2. 파일 업로드
-    3. 원하는 지역과 기간 선택
-    """)
-    st.markdown("---")
+    # 지역 매핑 (주요 지역 바로가기)
+    REGIONS = ['전국', '서울', '경기', '인천', '부산', '대구', '대전', '광주', '울산', '세종']
 
-# 주요 지역 정의 (매핑을 위해)
-REGIONS = {
-    '서울': ['서울', '강북', '강남', '도봉', '노원', '성북', '은평', '서대문', '마포', '양천', '강서', '구로', '금천', '영등포', '동작', '관악', '서초', '송파', '강동', '종로', '중구', '용산', '성동', '광진', '동대문', '중랑'],
-    '경기': ['경기', '수원', '성남', '고양', '용인', '부천', '안산', '남양주', '안양', '화성', '평택', '의정부', '시흥', '파주', '광명', '김포', '군포', '광주', '이천', '양주', '오산', '구리', '안성', '포천', '의왕', '하남', '과천', '여주', '동두천'],
-    '인천': ['인천', '중구', '동구', '미추홀', '연수', '남동', '부평', '계양', '서구'],
-    '부산': ['부산', '중구', '서구', '동구', '영도', '부산진', '동래', '남구', '북구', '해운대', '사하', '금정', '강서', '연제', '수영', '사상', '기장'],
-    '대구': ['대구', '중구', '동구', '서구', '남구', '북구', '수성', '달서', '달성'],
-    '대전': ['대전', '동구', '중구', '서구', '유성', '대덕'],
-    '광주': ['광주', '동구', '서구', '남구', '북구', '광산'],
-    '울산': ['울산', '중구', '남구', '동구', '북구', '울주'],
-    '세종': ['세종'],
-    '전국': ['전국']
-}
-
-# -----------------------------------------------------------------------------
-# 4. 메인 로직
-# -----------------------------------------------------------------------------
 if uploaded_file:
-    try:
-        # (1) 엑셀 로드
-        xls = pd.ExcelFile(uploaded_file)
-        sheet_names = xls.sheet_names
-        
-        # '매매' 시트 자동 감지
-        default_idx = 0
-        for i, name in enumerate(sheet_names):
-            if "매매" in name and "종합" in name:
-                default_idx = i
-                break
-        
+    # 1. 매매 & 전세 데이터 동시 로드
+    df_sale = load_and_clean_data(uploaded_file, "매매")
+    df_jeonse = load_and_clean_data(uploaded_file, "전세")
+
+    if df_sale is None or df_jeonse is None:
+        st.error("엑셀 파일에서 '매매종합' 또는 '전세종합' 시트를 찾을 수 없습니다.")
+    else:
+        # 2. 지역 선택 (사이드바)
         with st.sidebar:
-            st.header("⚙️ 분석 옵션")
-            selected_sheet = st.selectbox("분석 시트 선택", sheet_names, index=default_idx)
-        
-        # 데이터 읽기 (헤더 10행 기준)
-        df = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=10)
-        
-        # ★ [오류 수정 핵심] 모든 컬럼명을 문자열(String)로 강제 변환
-        df.columns = df.columns.astype(str)
-        
-        # 날짜 컬럼 처리
-        df.rename(columns={df.columns[0]: '날짜'}, inplace=True)
-        df['날짜_변환'] = pd.to_datetime(df['날짜'], errors='coerce')
-        df = df.dropna(subset=['날짜_변환'])
-        df['날짜'] = df['날짜_변환']
-        df = df.drop(columns=['날짜_변환'])
-        
-        # (2) 지역 선택 로직
-        all_cols = [c for c in df.columns if c != '날짜']
-        
-        with st.sidebar:
-            main_region = st.selectbox("📍 대지역 선택", list(REGIONS.keys()))
+            st.markdown("---")
+            st.subheader("📍 지역 선택")
+            main_region = st.selectbox("대분류", REGIONS)
             
-            # 선택한 대지역에 해당하는 컬럼만 필터링 (스마트 검색)
-            # 1. REGIONS 사전에 있는 키워드가 포함된 컬럼 찾기
-            # 2. 혹은 KB 엑셀 특성상 '서울 강남구' 처럼 되어있을 수 있으므로 대지역명이 포함된 것도 찾기
-            
-            keywords = REGIONS[main_region]
-            sub_regions = []
+            # 선택한 대분류에 포함된 상세 지역 추출
+            # (매매 데이터 기준 컬럼리스트 사용)
+            all_cols = [c for c in df_sale.columns if c != '날짜']
             
             if main_region == '전국':
-                # 전국 선택 시 주요 광역시만 보여주기
-                sub_regions = [c for c in all_cols if c in REGIONS.keys() or c == '전국']
+                sub_candidates = REGIONS # 전국일 땐 광역시도만
             else:
-                for col in all_cols:
-                    # 컬럼명에 키워드가 포함되어 있는지 확인
-                    for key in keywords:
-                        if key in col:
-                            sub_regions.append(col)
-                            break
+                # 해당 지역명이 포함된 컬럼만 필터링
+                sub_candidates = [c for c in all_cols if main_region in c]
             
             # 중복 제거 및 정렬
-            sub_regions = sorted(list(set(sub_regions)))
+            sub_candidates = sorted(list(set(sub_candidates)))
             
-            # 만약 못 찾았으면 전체 보여주기 (안전장치)
-            if not sub_regions:
-                sub_regions = all_cols
-            
-            # 상세 지역 다중 선택
-            selected_subs = st.multiselect(
-                "상세 지역 선택 (복수 선택 가능)", 
-                sub_regions, 
-                default=sub_regions[:1] if sub_regions else None
-            )
+            selected_sub = st.selectbox("상세 지역 (하나만 선택)", sub_candidates)
 
-        # (3) 차트 및 대시보드 표출
-        if selected_subs:
-            # 기간 필터링
-            filtered_df = df[['날짜'] + selected_subs].sort_values('날짜')
+        # 3. 데이터 시각화 및 분석
+        if selected_sub:
+            col1, col2 = st.columns([2, 1])
             
-            # 최신 데이터 요약 카드 (Metrics)
-            last_date = filtered_df['날짜'].iloc[-1].strftime('%Y.%m.%d')
-            st.subheader(f"📊 {main_region} 시장 동향 ({last_date} 기준)")
+            # [차트 데이터 준비]
+            # 해당 지역의 매매/전세 데이터 추출
+            sale_series = df_sale[['날짜', selected_sub]].set_index('날짜')[selected_sub]
             
-            # 컬럼 3개로 나누어 최신 지수 보여주기
-            cols = st.columns(min(len(selected_subs), 4))
-            for idx, region in enumerate(selected_subs[:4]): # 최대 4개까지만 카드 보여줌
-                latest_val = filtered_df[region].iloc[-1]
-                prev_val = filtered_df[region].iloc[-2]
-                diff = latest_val - prev_val
+            # 전세 데이터가 없는 지역이 있을 수 있으므로 체크
+            if selected_sub in df_jeonse.columns:
+                jeonse_series = df_jeonse[['날짜', selected_sub]].set_index('날짜')[selected_sub]
+            else:
+                jeonse_series = None
+
+            # ---------------------------
+            # 왼쪽: 차트 및 지표
+            # ---------------------------
+            with col1:
+                st.subheader(f"📈 {selected_sub} 시세 흐름")
                 
-                with cols[idx]:
-                    st.metric(
-                        label=region, 
-                        value=f"{latest_val:.1f}", 
-                        delta=f"{diff:.2f}",
-                        delta_color="normal" # 상승 빨강, 하락 파랑 자동
-                    )
-
-            # 차트 그리기 (기간 슬라이더 포함)
-            st.markdown("### 📈 시계열 변동 차트")
-            melted_df = filtered_df.melt(id_vars=['날짜'], var_name='지역', value_name='지수')
-            
-            fig = px.line(melted_df, x='날짜', y='지수', color='지역', markers=True)
-            fig.update_layout(
-                xaxis=dict(
-                    rangeslider=dict(visible=True), # 하단 슬라이더
-                    type="date"
-                ),
-                height=500,
-                hovermode="x unified",
-                template="plotly_white" # 깔끔한 흰색 배경
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            # (4) 뉴스 및 추가 정보
-            st.markdown("### 📰 관련 뉴스 및 분석")
-            
-            # 탭으로 구분
-            tab1, tab2 = st.tabs(["네이버 뉴스", "상세 데이터"])
-            
-            with tab1:
-                target = selected_subs[0] if selected_subs else main_region
-                query = f"{main_region} {target} 부동산 전망"
-                url = f"https://search.naver.com/search.naver?where=news&query={query}"
+                # 최신 지표 카드 (Metric)
+                last_date = sale_series.index[-1].strftime('%Y.%m.%d')
                 
-                st.markdown(f"""
-                <div style="background-color:#F0FDF4; padding:15px; border-radius:10px; border:1px solid #BBF7D0;">
-                    <strong>🔍 '{target}' 관련 최신 뉴스를 확인해보세요.</strong><br><br>
-                    <a href="{url}" target="_blank" style="text-decoration:none;">
-                        <button style="background-color:#03C75A; color:white; border:none; padding:10px 20px; border-radius:5px; font-weight:bold; cursor:pointer;">
-                            N 네이버 뉴스 검색 바로가기
-                        </button>
-                    </a>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with tab2:
-                st.dataframe(filtered_df.sort_values('날짜', ascending=False), use_container_width=True)
+                cur_sale = sale_series.iloc[-1]
+                prev_sale = sale_series.iloc[-2]
+                diff_sale = cur_sale - prev_sale
+                
+                m_col1, m_col2 = st.columns(2)
+                with m_col1:
+                    st.metric("매매 지수", f"{cur_sale:.1f}", f"{diff_sale:.2f}")
+                
+                if jeonse_series is not None:
+                    cur_jeonse = jeonse_series.iloc[-1]
+                    prev_jeonse = jeonse_series.iloc[-2]
+                    diff_jeonse = cur_jeonse - prev_jeonse
+                    with m_col2:
+                        st.metric("전세 지수", f"{cur_jeonse:.1f}", f"{diff_jeonse:.2f}")
 
-        else:
-            st.warning("👈 왼쪽 사이드바에서 상세 지역을 하나 이상 선택해주세요.")
+                # Plotly 차트 그리기 (커스텀)
+                fig = go.Figure()
+                
+                # 매매 (빨강)
+                fig.add_trace(go.Scatter(
+                    x=sale_series.index, 
+                    y=sale_series.values,
+                    mode='lines',
+                    name='매매',
+                    line=dict(color='#EF4444', width=2) # 붉은색
+                ))
+                
+                # 전세 (파랑)
+                if jeonse_series is not None:
+                    fig.add_trace(go.Scatter(
+                        x=jeonse_series.index, 
+                        y=jeonse_series.values,
+                        mode='lines',
+                        name='전세',
+                        line=dict(color='#3B82F6', width=2) # 파란색
+                    ))
 
-    except Exception as e:
-        st.error("🚨 데이터를 처리하는 중 문제가 발생했습니다.")
-        st.code(f"에러 내용: {e}")
-        st.info("💡 팁: 다운로드 받은 KB 엑셀 파일을 수정하지 말고 그대로 올려주세요.")
+                # 차트 레이아웃 설정 (슬라이더 제거, 깔끔하게)
+                fig.update_layout(
+                    height=500,
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    xaxis=dict(
+                        rangeslider=dict(visible=False), # ★ 슬라이더 제거 요청 반영
+                        showgrid=False
+                    ),
+                    yaxis=dict(showgrid=True, gridcolor='#eee'),
+                    template='plotly_white'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # ---------------------------
+            # 오른쪽: 실시간 뉴스
+            # ---------------------------
+            with col2:
+                st.subheader("📰 실시간 부동산 뉴스")
+                st.write(f"**'{selected_sub} 부동산'** 검색 결과")
+                
+                # 뉴스 크롤링 호출
+                news_items = get_real_news(f"{selected_sub} 부동산")
+                
+                if news_items:
+                    for news in news_items:
+                        st.markdown(f"""
+                        <div class="news-card">
+                            <a href="{news['link']}" target="_blank" class="news-title">{news['title']}</a>
+                            <p style="font-size:0.9em; color:#666; margin-top:5px;">{news['desc'][:60]}...</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.info("관련 뉴스를 찾을 수 없습니다.")
+
+            # 하단: 상세 데이터 표 (접기/펼치기)
+            with st.expander("📄 상세 데이터 표 보기"):
+                # 매매/전세 합치기
+                merged_df = pd.DataFrame({'매매': sale_series})
+                if jeonse_series is not None:
+                    merged_df['전세'] = jeonse_series
+                
+                st.dataframe(merged_df.sort_index(ascending=False))
 
 else:
-    # 파일 업로드 전 초기 화면 (예쁘게)
-    st.markdown("""
-    <div style="text-align:center; padding: 50px;">
-        <h2>👋 환영합니다!</h2>
-        <p style="color:gray;">왼쪽 사이드바에서 <strong>KB 부동산 엑셀 파일</strong>을 업로드하면<br>
-        전문가 수준의 차트와 분석을 바로 보실 수 있습니다.</p>
-    </div>
-    """, unsafe_allow_html=True)
+    # 파일 업로드 전 안내
+    st.info("👈 왼쪽 사이드바에서 KB 시계열 엑셀 파일을 업로드해주세요.")
