@@ -5,4 +5,4 @@ gspread
 oauth2client
 openpyxl
 requests
-PublicDataReader  <-- 이거 한 줄 추가!
+cloudscraper
