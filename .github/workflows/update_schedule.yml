@@ -4,7 +4,7 @@ on:
   schedule:
     # 매주 금요일 오후 6시 (한국시간) -> UTC 기준 오전 9시
     - cron: '0 9 * * 5'
-  workflow_dispatch: # 수동 실행 버튼 (테스트용)
+  workflow_dispatch: # 수동 실행 버튼
 
 jobs:
   update-job:
@@ -20,8 +20,11 @@ jobs:
           python-version: '3.9'
 
       - name: 필요한 라이브러리 설치
+        # requirements.txt 파일에 있는 모든 라이브러리를 설치합니다.
+        # 만약 requirements.txt가 없어도 에러가 안 나게 PublicDataReader를 강제로 한번 더 설치합니다.
         run: |
-          pip install pandas openpyxl gspread oauth2client requests
+          pip install -r requirements.txt || true
+          pip install pandas openpyxl gspread oauth2client requests PublicDataReader
 
       - name: 데이터 업데이트 스크립트 실행
         env:
